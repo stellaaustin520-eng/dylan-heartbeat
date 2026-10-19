@@ -15,6 +15,7 @@ const {
 // 批注 2026-08-10：与 Gateway 共用同一 DATA_DIR；未配置时仍落回项目目录，保护旧 VPS/本机部署。
 const DATA_DIR = ensureDataDir();
 const TIMELINE_PATH = runtimeFile("enhanced_messages.json");
+const TIMESTAMP_DB_PATH = runtimeFile("message_timestamps.json");
 const PORT = Number(process.env.PORT) || 3000;
 const GATEWAY_BASE_URL = (process.env.GATEWAY_BASE_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
 const GATEWAY_URL = `${GATEWAY_BASE_URL}/internal/wake-event`;
@@ -340,15 +341,44 @@ function parseTimelineTimestamp(value) {
   return zonedWallTimeToDate({ year: yyyy, month, day, hour, minute }, TIME_ZONE);
 }
 
-function getLastUserTime(messages) {
-  const reversed = [...messages].reverse();
-  for (const msg of reversed) {
-    if (msg.role === "user") {
-      const content = normalizeContentToText(msg.content);
-      // 批注 2026-07-15：兼容 Kelivo 时间前缀 "YYYY-MM-DDHH:mm"；
-      // 旧的 "YYYY-MM-DD HH:mm" 仍然可用，避免无空格时间导致 wake-up 误判没有用户时间。
-      const parsed = parseTimelineTimestamp(content);
-      if (parsed) return parsed;
+// 批注 2026-10-19：Kelivo 会把历史消息的时间前缀裁掉，时间线正文里常常已经读不到时间。
+// server.js 早已把每条消息的原始时间写进 message_timestamps.json，这里补上同样的回退查询，
+// 避免正文丢前缀后 wake-up 永远打印“未找到用户时间”。
+function loadTimestampDB() {
+  if (!fs.existsSync(TIMESTAMP_DB_PATH)) return {};
+  try {
+    return JSON.parse(fs.readFileSync(TIMESTAMP_DB_PATH, "utf-8"));
+  } catch {
+    return {};
+  }
+}
+
+function stripLeadingTimestamp(content) {
+  return String(content || "")
+    .replace(/^（?\s*\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[ T]?)\d{1,2}[:：]\d{2}[）\s]*/, "")
+    .trim();
+}
+
+function makeFingerprint(msg) {
+  const content = normalizeContentToText(msg.content).trim().slice(0, 150);
+  return `${msg.role}::${content}`;
+}
+
+function makeFingerprintStripped(msg) {
+  const content = stripLeadingTimestamp(normalizeContentToText(msg.content)).slice(0, 150);
+  return `${msg.role}::${content}`;
+}
+
+function getLastUserTime(messages, tsDB = loadTimestampDB()) {
+  for (const msg of [...messages].reverse()) {
+    if (msg.role !== "user") continue;
+    const content = normalizeContentToText(msg.content);
+    const fromContent = parseTimelineTimestamp(content);
+    if (fromContent) return fromContent;
+    const remembered = tsDB[makeFingerprint(msg)] || tsDB[makeFingerprintStripped(msg)];
+    if (remembered) {
+      console.log(`用户时间来自时间戳记忆库：${remembered}`);
+      return new Date(remembered);
     }
   }
   return null;
