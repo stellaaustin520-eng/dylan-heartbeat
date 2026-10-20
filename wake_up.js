@@ -369,19 +369,45 @@ function makeFingerprintStripped(msg) {
   return `${msg.role}::${content}`;
 }
 
-function getLastUserTime(messages, tsDB = loadTimestampDB()) {
+function getLastUserTime(messages, tsDB = loadTimestampDB(), now = new Date()) {
+  const db = tsDB && typeof tsDB === "object" && !Array.isArray(tsDB) ? tsDB : {};
+  const latestAllowed = now.getTime();
+  function validUserTime(value) {
+    if (typeof value !== "string" || !value.trim()) return null;
+    const date = new Date(value);
+    const time = date.getTime();
+    return Number.isFinite(time) && time <= latestAllowed ? date : null;
+  }
+
   for (const msg of [...messages].reverse()) {
     if (msg.role !== "user") continue;
     const content = normalizeContentToText(msg.content);
     const fromContent = parseTimelineTimestamp(content);
-    if (fromContent) return fromContent;
-    const remembered = tsDB[makeFingerprint(msg)] || tsDB[makeFingerprintStripped(msg)];
-    if (remembered) {
-      console.log(`用户时间来自时间戳记忆库：${remembered}`);
-      return new Date(remembered);
+    if (fromContent && Number.isFinite(fromContent.getTime()) && fromContent.getTime() <= latestAllowed) {
+      return fromContent;
+    }
+    for (const fp of [makeFingerprint(msg), makeFingerprintStripped(msg)]) {
+      const remembered = validUserTime(db[fp]);
+      if (remembered) {
+        console.log(`用户时间来自时间戳记忆库：${remembered.toISOString()}`);
+        return remembered;
+      }
     }
   }
-  return null;
+
+  // 批注 2026-10-20：独立请求可能替换当前时间线，正文与指纹都不再匹配。
+  // 最后回退到持久库中最近的有效用户时间；助手回复和未来时间不能算用户活动。
+  // 该库是服务共享的兜底来源，不代表当前请求的会话时间。
+  let latestUserTime = null;
+  for (const [fp, value] of Object.entries(db)) {
+    if (!fp.startsWith("user::")) continue;
+    const remembered = validUserTime(value);
+    if (remembered && (!latestUserTime || remembered > latestUserTime)) latestUserTime = remembered;
+  }
+  if (latestUserTime) {
+    console.log(`兜底：使用时间戳库最近用户时间 ${latestUserTime.toISOString()}`);
+  }
+  return latestUserTime;
 }
 
 function stripPosition(messages) {
