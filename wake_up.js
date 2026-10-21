@@ -486,7 +486,7 @@ async function runWakeUp() {
     .filter(msg => msg.role !== "system")
     .filter(msg => {
       const c = normalizeContentToText(msg.content);
-      return !c.includes("<memories>") && !c.includes("记忆库使用策略");
+      return !c.includes("<memories>") && !c.includes("记忆库使用策略") && !c.includes("<extracted>") && !c.includes("</extracted>") && !c.includes("<item type=");
     })
     .map(msg => {
       const userDisplay = process.env.USER_DISPLAY_NAME || "用户";
