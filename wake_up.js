@@ -168,7 +168,7 @@ function isDayTime(date = new Date()) {
 
 function getWakeAfterMinutes(date = new Date()) {
   return isDayTime(date)
-    ? readNumberEnv("DAY_WAKE_AFTER_MINUTES", 60, { min: 1 })
+    ? readNumberEnv("DAY_WAKE_AFTER_MINUTES", 45, { min: 1 })
     : readNumberEnv("NIGHT_WAKE_AFTER_MINUTES", 120, { min: 1 });
 }
 
