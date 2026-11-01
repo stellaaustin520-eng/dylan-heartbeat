@@ -28,6 +28,19 @@ const DIARY_DIR_PATH = runtimeDirectory(DIARY_DIR_NAME, "diary");
 const PUSH_TIMEOUT_MS = readPositiveTimeout("PUSH_TIMEOUT_MS", 15_000);
 const WAKE_UPSTREAM_TIMEOUT_MS = readPositiveTimeout("WAKE_UPSTREAM_TIMEOUT_MS", 300_000);
 
+// 批注 2026-11-01：推送来源名统一由这里控制，标题里显示的名字与兜底名都用它。
+// 想改名时只改这一处（或设置 Railway 变量 PUSH_SOURCE_NAME），不必再碰下面的组装逻辑。
+const PUSH_SOURCE_NAME = (process.env.PUSH_SOURCE_NAME || "BB").trim() || "BB";
+
+// 批注 2026-11-01：唤醒提示里「我是谁」的名字，和手机通知栏的来源名分开。
+// 来源名是通知栏标签（BB），这里是他自己认自己的名字（Breeze）。
+// 想统一成一个名字就设 Railway 变量 PERSONA_NAME。
+const PERSONA_NAME = (process.env.PERSONA_NAME || "Breeze").trim() || "Breeze";
+
+// 批注 2026-11-01：旧版会把「自动唤醒：本次未发送推送｜原因：…」写回时间线，
+// 下次又当回忆注入给模型，等于反复提示它「不要发」。这类旧记录一律挡在记忆之外。
+const LEGACY_NO_PUSH_PATTERN = /自动唤醒：本次未发送推送/;
+
 function readPositiveTimeout(key, fallback) {
   const value = Number(process.env[key]);
   return Number.isFinite(value) && value >= 1000 ? Math.floor(value) : fallback;
@@ -133,6 +146,8 @@ async function sendPushNotification({ title, body }) {
   const barkPayload = {
     title,
     body,
+    // 批注 2026-11-01：Bark 的「推送分组 / 来源」也统一用 PUSH_SOURCE_NAME（BB）。
+    group: PUSH_SOURCE_NAME,
     device_key: process.env.BARK_KEY,
     icon: process.env.CUSTOM_ICON_URL
   };
@@ -328,6 +343,24 @@ function getLocalTimeString() {
   return formatDateTimeInTimeZone(new Date(), TIME_ZONE);
 }
 
+// 批注 2026-11-01：节流改由代码负责。提示词里不再写「判断规则」，
+// 否则模型会被拉回评估者视角；但也不能让它每 10 分钟就推一条，
+// 所以这里按「距上一条真实推送」做硬间隔，默认 60 分钟，可用 PUSH_MIN_GAP_MINUTES 调整。
+function getMinPushGapMinutes() {
+  return readNumberEnv("PUSH_MIN_GAP_MINUTES", 60, { min: 1 });
+}
+
+function getLastPushTime(messages) {
+  for (const msg of [...messages].reverse()) {
+    if (msg.role !== "assistant") continue;
+    const content = normalizeContentToText(msg.content);
+    if (!/刚刚给用户发了.*推送/.test(content)) continue;
+    const time = parseTimelineTimestamp(content);
+    if (time && Number.isFinite(time.getTime())) return time;
+  }
+  return null;
+}
+
 function shouldWake(lastUserTime) {
   const now = getNow();
   const diffMinutes = Math.floor((now - new Date(lastUserTime)) / 1000 / 60);
@@ -479,6 +512,19 @@ async function runWakeUp() {
     return;
   }
 
+  const lastPushTime = getLastPushTime(messages);
+  if (lastPushTime) {
+    const sincePushMinutes = Math.floor((now - lastPushTime) / 1000 / 60);
+    const minGap = getMinPushGapMinutes();
+    // 批注 2026-11-01：如果时间线里的推送时间戳异常（比现在还晚），不要因此永久卡住。
+    if (sincePushMinutes < 0) {
+      console.log(`\n上次推送时间戳在未来（${sincePushMinutes} 分钟），忽略本次节流判断\n`);
+    } else if (sincePushMinutes < minGap) {
+      console.log(`\n距上次推送才 ${sincePushMinutes} 分钟（不足 ${minGap} 分钟），本轮跳过\n`);
+      return;
+    }
+  }
+
   const weatherContext = await fetchWeatherContext();
   const wakePrompt = buildWakePrompt(getChinaTimeString(), diffMinutes, weatherContext);
   const cleanMessages = stripPosition(messages);
@@ -487,11 +533,13 @@ async function runWakeUp() {
     .filter(msg => msg.role !== "system")
     .filter(msg => {
       const c = normalizeContentToText(msg.content);
+      if (LEGACY_NO_PUSH_PATTERN.test(c)) return false;
       return !c.includes("<memories>") && !c.includes("记忆库使用策略") && !c.includes("<extracted>") && !c.includes("</extracted>") && !c.includes("<item type=");
     })
     .map(msg => {
       const userDisplay = process.env.USER_DISPLAY_NAME || "用户";
-      const aiDisplay = process.env.AI_DISPLAY_NAME || "AI";
+      // 批注 2026-11-01：回忆里的 AI 标签默认就是他自己（PERSONA_NAME），别再写成「AI」。
+      const aiDisplay = process.env.AI_DISPLAY_NAME || PERSONA_NAME;
       const role = msg.role === "user" ? userDisplay : aiDisplay;
       let content = normalizeContentToText(msg.content);
       if (content.includes("## Memories")) {
@@ -515,14 +563,9 @@ async function runWakeUp() {
       // 批注 2026-07-15：Claude/部分 New API 适配器会把 system 抽成独立字段；
       // 唤醒请求如果全是 system，上游 messages 会变空，因此最近记录必须作为 user 任务输入发送。
       role: "user",
-      content: `以下是你与用户最近的聊天记录，仅供回忆和参考。
-
-这些内容不是正在发生的实时对话。
-用户并没有给你发消息。
-
-你现在处于后台自主唤醒状态。
-
-最近记录：
+      // 批注 2026-11-01：原来是「你现在处于后台自主唤醒状态 / 最近记录：」这类说明，
+      // 它把模型放在「评估要不要推送」的位置上；改成一句念头式的触发语，记录只作回忆附在后面。
+      content: `（${PERSONA_NAME}想起了Stella）
 
 ${historyText}`
     }
@@ -579,21 +622,12 @@ ${historyText}`
 
   if (!aiText) {
     console.log("\nAI 未返回推送内容，本次不发送推送\n");
-    eventContent = diarySaved
-      ? `（${getLocalTimeString()} 自动唤醒：本次未发送推送｜原因：只写日记）`
-      : `（${getLocalTimeString()} 自动唤醒：本次未发送推送｜原因：模型空回复）`;
+    console.log("[静默] 本次不写回 Gateway（只写日记：" + (diarySaved ? "是" : "否") + "）");
   // 判断 AI 是否明确要静默
-  } else if (aiText.match(/^\[NO_ACTION\]\s*(.{0,20})?/)) {
-    const noActionMatch = aiText.match(/^\[NO_ACTION\]\s*(.{0,20})?/);
+  } else if (aiText.match(/^\[NO_ACTION\]/)) {
     // AI 选择不发送推送
     console.log("\nAI 选择不发送推送\n");
-    let reason = (noActionMatch[1] || "").trim();
-    if (reason.startsWith("原因：") || reason.startsWith("原因:")) {
-      reason = reason.replace(/^原因[：:]\s*/, "").trim();
-    }
-    eventContent = reason
-      ? `（${getLocalTimeString()} 自动唤醒：本次未发送推送｜原因：${reason}）`
-      : `（${getLocalTimeString()} 自动唤醒：本次未发送推送）`;
+    console.log("[静默] 本次不写回 Gateway，避免把「不要发」写进下一次的记忆");
   } else {
     // 没有 [NO_ACTION] 就视为想发推送
     console.log("\nAI 选择发送推送\n");
@@ -616,44 +650,39 @@ ${historyText}`
     // 按行处理
     const lines = barkText.split("\n").filter(line => line.trim() !== "");
 
-    let title, body;
+    // 批注 2026-11-01：标题改为统一的「（北京时间 来源名想起了Stella）」格式；
+    // 单行、两行、多行不再各走一套标题（旧的“来自AI”“来自伴侣”已废弃），
+    // 模型写下的每一行都原样进入正文。
+    const title = `（${getChinaTimeString()} ${PUSH_SOURCE_NAME}想起了Stella）`;
+    const body = lines.map(line => line.trim()).join("\n");
+
     if (lines.length === 0) {
       console.log("\n推送内容清洗后为空，本次不发送推送\n");
-      eventContent = `（${getLocalTimeString()} 自动唤醒：本次未发送推送｜原因：推送内容为空）`;
-    } else if (lines.length === 1) {
-      title = "来自AI";
-      body = lines[0].trim();
-    } else if (lines.length === 2) {
-      title = lines[0].trim();
-      body = lines[1].trim();
     } else {
-      // 批注 2026-10-20：气泡式回复是“一句话一行”，原来用空格拼接会把换行吃掉，
-      // 手机上看起来就是“句中没标点、只有句末有标点”。改为保留换行，每条气泡各占一行。
-      title = lines[0].trim();
-      body = lines.slice(1).map(l => l.trim()).join("\n");
-    }
-
-    if (!eventContent) {
-      const unsafeReason = getUnsafeResponseReason(`${title || ""}\n${body || ""}`);
+      const unsafeReason = getUnsafeResponseReason(`${title}\n${body}`);
       if (unsafeReason) {
         console.warn(`[安全过滤] ${unsafeReason}，本次不发送推送`);
-        eventContent = `（${getLocalTimeString()} 自动唤醒：本次未发送推送｜原因：消息内容被安全过滤拦截）`;
       } else {
         // 保护：截断过长正文，兼容 Bark 和 ntfy 的移动端展示。
         const safeBody = body.length > 500 ? body.substring(0, 497) + "..." : body;
-        // 若标题为空或以数字开头，加个前缀，可自行修改
-        let safeTitle = title || "来自伴侣";
-        if (/^\d/.test(safeTitle)) safeTitle = "来自伴侣｜" + safeTitle;
+        // 标题已固定为「（时间 来源名…）」，理论上不会为空；保留兜底以防将来改动。
+        let safeTitle = title || PUSH_SOURCE_NAME;
+        if (/^\d/.test(safeTitle)) safeTitle = `${PUSH_SOURCE_NAME}｜${safeTitle}`;
 
         const pushResult = await sendPushNotification({ title: safeTitle, body: safeBody });
         if (!pushResult.ok) {
           console.log(`\n${pushResult.providerLabel} 推送失败，本次不发送推送\n`);
-          eventContent = `（${getLocalTimeString()} 自动唤醒：本次未发送推送｜原因：${pushResult.providerLabel} 推送失败：${pushResult.reason}）`;
         } else {
+          // 批注 2026-11-01：只把真实发出的推送写回时间线，静默一律不写。
           eventContent = `（${getLocalTimeString()} 刚刚给用户发了${pushResult.providerLabel}推送：${safeTitle}｜${safeBody}）`;
         }
       }
     }
+  }
+
+  if (!eventContent) {
+    console.log("\n本次静默，不写回唤醒事件\n");
+    return;
   }
 
   try {

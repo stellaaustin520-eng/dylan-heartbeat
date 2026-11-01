@@ -295,6 +295,12 @@ function isSpecialEvent(msg) {
   return isSpecialEventContent(normalizeContentToText(msg.content));
 }
 
+// 批注 2026-11-01：旧版把「自动唤醒：本次未发送推送｜原因：…」当成特殊事件注入给模型，
+// 等于每轮都在提醒它「不要发」。这些记录仍留在时间线文件里，但不再喂给 LLM。
+function isLegacyNoPushEvent(msg) {
+  return /自动唤醒：本次未发送推送/.test(normalizeContentToText(msg.content));
+}
+
 function isRealMessageForTimeline(msg) {
   if (msg.role === "system") return false;
   if (msg.tool_calls) return false;
@@ -594,7 +600,7 @@ app.post("/v1/chat/completions", async (req, reply) => {
       .filter(Boolean);
 
     const oldEvents = stripPosition(
-      oldTimeline.filter(isSpecialEvent).sort((a, b) => {
+      oldTimeline.filter(isSpecialEvent).filter(msg => !isLegacyNoPushEvent(msg)).sort((a, b) => {
         const timeA = extractTimestampWithMemory(a, tsDB);
         const timeB = extractTimestampWithMemory(b, tsDB);
         if (timeA && timeB) return timeA - timeB;
