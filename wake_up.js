@@ -672,10 +672,10 @@ ${historyText}`
     // 按行处理
     const lines = barkText.split("\n").filter(line => line.trim() !== "");
 
-    // 批注 2026-11-01：标题改为统一的「（北京时间 来源名想起了Stella）」格式；
-    // 单行、两行、多行不再各走一套标题（旧的“来自AI”“来自伴侣”已废弃），
-    // 模型写下的每一行都原样进入正文。
-    const title = `（${getChinaTimeString()} ${PUSH_SOURCE_NAME}想起了Stella）`;
+    // 历史上标题曾是「（北京时间 来源名想起了Stella）」，2026-11-02 取消——通知栏不要一长串。
+    // 批注 2026-11-02：标题固定为来源名（默认 BB），通知栏只显示「BB」；
+    // 时间戳不再进标题——模型写下的每一行原样作为正文，时间看系统自带的时间即可。
+    const title = PUSH_SOURCE_NAME;
     const body = lines.map(line => line.trim()).join("\n");
 
     if (lines.length === 0) {
@@ -687,16 +687,15 @@ ${historyText}`
       } else {
         // 保护：截断过长正文，兼容 Bark 和 ntfy 的移动端展示。
         const safeBody = body.length > 500 ? body.substring(0, 497) + "..." : body;
-        // 标题已固定为「（时间 来源名…）」，理论上不会为空；保留兜底以防将来改动。
+        // 标题就是来源名，不会再为空；保留兜底以防将来改动。
         let safeTitle = title || PUSH_SOURCE_NAME;
-        if (/^\d/.test(safeTitle)) safeTitle = `${PUSH_SOURCE_NAME}｜${safeTitle}`;
 
         const pushResult = await sendPushNotification({ title: safeTitle, body: safeBody });
         if (!pushResult.ok) {
           console.log(`\n${pushResult.providerLabel} 推送失败，本次不发送推送\n`);
         } else {
           // 批注 2026-11-01：只把真实发出的推送写回时间线，静默一律不写。
-          eventContent = `（${getLocalTimeString()} 刚刚给用户发了${pushResult.providerLabel}推送：${safeTitle}｜${safeBody}）`;
+          eventContent = `（${getLocalTimeString()} 刚刚给用户发了${pushResult.providerLabel}推送：${safeBody}）`;
         }
       }
     }
