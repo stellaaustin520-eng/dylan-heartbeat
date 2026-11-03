@@ -71,6 +71,20 @@ function getDiaryTimeString(date = new Date()) {
 }
 
 // 批注 2026-07-11：日记只接受模型显式输出的 [DIARY] 块，避免把普通推送内容误写进本地日记。
+// 批注 2026-11-03：提示词里说「可以留一段」，但模型不知道今天写过没有。
+// 把真实份数注入 prompt，让「要不要写」变成可判断的状态，而不是靠感觉。
+function getDiaryTodaySummary(date = new Date()) {
+  const diaryFile = path.join(DIARY_DIR_PATH, `${getDiaryDateString(date)}.md`);
+  try {
+    if (!fs.existsSync(diaryFile)) return "（今天还没写过）";
+    const text = fs.readFileSync(diaryFile, "utf-8");
+    // 只认 appendDiaryEntry 写入的 "## YYYY-MM-DD HH:MM" 标题，避免正文里的 markdown 被误计。
+    const count = (text.match(/^## \d{4}-\d{2}-\d{2} \d{2}:\d{2}$/gm) || []).length;
+    return count > 0 ? `（今天你已经写过 ${count} 段）` : "（今天还没写过）";
+  } catch {
+    return "";
+  }
+}
 function extractDiaryFromResponse(text) {
   const diaryBlocks = [];
   const remainingText = String(text || "").replace(/\[DIARY\]([\s\S]*?)\[\/DIARY\]/gi, (_, content) => {
@@ -449,12 +463,14 @@ function stripPosition(messages) {
 }
 
 function buildWakePrompt(currentTime, diffMinutes, weatherContext = "") {
+  const diaryToday = getDiaryTodaySummary();
   // 优先读取独立的提示词文件（推荐方式）
   const promptFile = path.join(__dirname, "wake_prompt.txt");
   if (fs.existsSync(promptFile)) {
     const template = fs.readFileSync(promptFile, "utf-8");
     return template
       .replace(/\$\{currentTime\}/g, currentTime)
+      .replace(/\$\{diaryToday\}/g, diaryToday)
       .replace(/\$\{diffMinutes\}/g, diffMinutes)
       .replace(/\$\{weatherContext\}/g, weatherContext)
       .replace(/\$\{weather\}/g, weatherContext);
@@ -465,6 +481,7 @@ function buildWakePrompt(currentTime, diffMinutes, weatherContext = "") {
     return process.env.WAKE_PROMPT_TEMPLATE
       .replace(/\\n/g, '\n')
       .replace(/\$\{currentTime\}/g, currentTime)
+      .replace(/\$\{diaryToday\}/g, diaryToday)
       .replace(/\$\{diffMinutes\}/g, diffMinutes)
       .replace(/\$\{weatherContext\}/g, weatherContext)
       .replace(/\$\{weather\}/g, weatherContext);
@@ -515,7 +532,8 @@ ${weatherContext}
 - 有些话此刻不想发出去、但想留住，就写进 [DIARY]...[/DIARY]。她不会收到通知，只留在你自己的本子里。
 - 只写日记、不发推送是可以的：整段只有 [DIARY]...[/DIARY]，不写推送正文。
 - 日记不用压到三十个字，可以写长，像真的在写字。
-- 如果距离她最后一条消息已经超过三小时，就留一段。
+- 如果距离她最后一条消息已经超过三小时，可以留一段。${diaryToday}
+- 一天一两段就够，不必每次都想。
 `;
 }
 
