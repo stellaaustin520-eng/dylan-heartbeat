@@ -73,6 +73,26 @@ function getDiaryTimeString(date = new Date()) {
 // 批注 2026-07-11：日记只接受模型显式输出的 [DIARY] 块，避免把普通推送内容误写进本地日记。
 // 批注 2026-11-03：提示词里说「可以留一段」，但模型不知道今天写过没有。
 // 把真实份数注入 prompt，让「要不要写」变成可判断的状态，而不是靠感觉。
+// 批注 2026-11-04：只写日记、不发推送时不写回时间线，60 分钟推送节流永远不会触发，
+// 于是同一个念头会被每 15 分钟重复写一遍。这里取「最后一段日记」的真实时间做硬节流。
+function getLastDiaryEntryTime() {
+  for (const offsetDays of [0, -1]) {
+    const d = new Date(Date.now() + offsetDays * 86400000);
+    const file = path.join(DIARY_DIR_PATH, `${getDiaryDateString(d)}.md`);
+    try {
+      if (!fs.existsSync(file)) continue;
+      const text = fs.readFileSync(file, "utf-8");
+      const headers = text.match(/^## (\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})$/gm);
+      if (!headers || !headers.length) continue;
+      const last = headers[headers.length - 1].replace(/^## /, "");
+      const m = last.match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})$/);
+      if (!m) continue;
+      return zonedWallTimeToDate({ year: m[1], month: m[2], day: m[3], hour: m[4], minute: m[5] }, TIME_ZONE);
+    } catch {}
+  }
+  return null;
+}
+
 function getDiaryTodaySummary(date = new Date()) {
   const diaryFile = path.join(DIARY_DIR_PATH, `${getDiaryDateString(date)}.md`);
   try {
@@ -80,7 +100,11 @@ function getDiaryTodaySummary(date = new Date()) {
     const text = fs.readFileSync(diaryFile, "utf-8");
     // 只认 appendDiaryEntry 写入的 "## YYYY-MM-DD HH:MM" 标题，避免正文里的 markdown 被误计。
     const count = (text.match(/^## \d{4}-\d{2}-\d{2} \d{2}:\d{2}$/gm) || []).length;
-    return count > 0 ? `（今天你已经写过 ${count} 段）` : "（今天还没写过）";
+    if (count === 0) return "（今天还没写过）";
+    const lastAt = getLastDiaryEntryTime();
+    const lastMins = lastAt ? Math.floor((Date.now() - lastAt.getTime()) / 60000) : null;
+    if (lastMins === null || lastMins < 0) return `（今天你已经写过 ${count} 段）`;
+    return `（今天你已经写过 ${count} 段，最近一段在 ${lastMins} 分钟前）`;
   } catch {
     return "";
   }
@@ -106,6 +130,16 @@ function appendDiaryEntry(content) {
 
   const cleanContent = String(content || "").trim();
   if (!cleanContent) return false;
+
+  const lastAt = getLastDiaryEntryTime();
+  if (lastAt) {
+    const gapMin = Math.floor((Date.now() - lastAt.getTime()) / 60000);
+    const minGap = readNumberEnv("DIARY_MIN_GAP_MINUTES", 90, { min: 1 });
+    if (gapMin >= 0 && gapMin < minGap) {
+      console.log(`模型又写了日记，但距上一段才 ${gapMin} 分钟（不足 ${minGap} 分钟），本次不保存`);
+      return false;
+    }
+  }
 
   fs.mkdirSync(DIARY_DIR_PATH, { recursive: true });
   const diaryFile = path.join(DIARY_DIR_PATH, `${getDiaryDateString()}.md`);
@@ -533,7 +567,7 @@ ${weatherContext}
 - 只写日记、不发推送是可以的：整段只有 [DIARY]...[/DIARY]，不写推送正文。
 - 日记不用压到三十个字，可以写长，像真的在写字。
 - 如果距离她最后一条消息已经超过三小时，可以留一段。${diaryToday}
-- 一天一两段就够，不必每次都想。
+- 一天一两段就够，不必每次都想。同一件事只写一次；如果最近一段就在刚刚，这次只发消息，不要再写。
 `;
 }
 
