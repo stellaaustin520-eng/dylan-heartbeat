@@ -132,9 +132,146 @@ function getDiaryTodaySummary(date = new Date()) {
     return "";
   }
 }
+// 批注 2026-11-06：加了「写完署时间」之后，模型习惯把时间写在 [/DIARY] 外面
+// （2026-11-04 真的出现过：日记后面跟一行 Wed Nov 04 17:31:05 GMT+08:00 2026）。
+// 那样一行会被当成推送正文发出去。只要本次确实写了日记，就把纯时间戳的行摘掉。
+const BARE_TIMESTAMP_LINE = /^\s*(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?|\d{1,2}[-/]\d{1,2}[-/]\d{4}(?:\s+\d{1,2}:\d{2})?|[A-Z][a-z]{2}\s+[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\S+\s+\d{4}|[A-Z][a-z]{2},?\s+\d{1,2}\s+[A-Z][a-z]{2}\s+\d{4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)\s*$/;
+function stripBareTimestampLines(text) {
+  const raw = String(text || "");
+  const kept = raw.split(/\r?\n/).filter((line) => !BARE_TIMESTAMP_LINE.test(line)).join("\n").trim();
+  if (kept !== raw.trim()) console.log("[日记] 纯时间戳的行留在本子里，不作为推送发送");
+  return kept;
+}
+
 // 批注 2026-11-04：模型有时把闭合标签写成 /DIARY]（少一个左方括号），
 // 或者回复被截断在闭合标签之前。严格匹配会让整段日记被当成推送正文发到手机上。
 // 改成容错解析：认不出来时，把 [DIARY] 之后的内容全部当日记，宁可少推一条，也不外发。
+// 批注 2026-11-06：2026-11-06 04:10 那篇日记，一个 "## " 标题底下堆了四块正文。
+// 前三块是同一段的三个草稿（开头一字不差），第四块是「今天不写」——嘴上拒绝，手上落了笔。
+// 根因：一次响应里所有 [DIARY] 块被 diaryBlocks.join("\n\n") 原样拼成一段，
+// 而 90 分钟节流是「每段」级的，一次唤醒只判一次，拦不住同一次回复里的重复。
+// 落笔前先做两件事：1) 拒绝式正文丢弃；2) 同一草稿的多稿只保留最长的一稿。
+const DIARY_SIGNATURE_CHARS = 40;
+const DIARY_MIN_DRAFT_SIGNATURE = 18;
+const DIARY_REFUSAL_PATTERNS = [
+  /^今天(?:就|便)?不(?:写|记)/,
+  /^今天(?:并|还)?没什么(?:要|好|值得|需要)(?:写|记|留住)/,
+  /^没什么(?:要|好|值得|需要)(?:写|记|留住)/,
+  /^这次(?:就)?(?:不写|不记)/,
+  /^不想写/,
+  /^不打算写/,
+  /^nothing\s+to\s+(?:write|record|say)/i,
+  /^no\s+entry\s+today/i,
+  /^i(?:'?m|\s+am)\s+not\s+writing/i
+];
+
+function normalizeDiaryQuote(text) {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/[\s\u3000]+/g, "")
+    .replace(/[^0-9a-z\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]+/g, "");
+}
+
+// 模型说「今天不写」，就别替它把这句话写进本子。只认开头，正文中间提到不算。
+function isDiaryRefusal(text) {
+  const head = String(text || "").trim().replace(/^["'‘“「『（(\s]+/, "");
+  if (!head) return false;
+  return DIARY_REFUSAL_PATTERNS.some((re) => re.test(head));
+}
+
+function diaryDraftSignature(group) {
+  const norm = normalizeDiaryQuote(group);
+  return norm.length >= DIARY_MIN_DRAFT_SIGNATURE ? norm.slice(0, DIARY_SIGNATURE_CHARS) : "";
+}
+
+// 一段日记的第一句一字不差地又出现一次，基本可以判定是「同一篇的改写」，不是新内容。
+function isSameDiaryDraft(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  if (a.length >= DIARY_MIN_DRAFT_SIGNATURE && b.startsWith(a)) return true;
+  if (b.length >= DIARY_MIN_DRAFT_SIGNATURE && a.startsWith(b)) return true;
+  return false;
+}
+
+// 把一个 [DIARY] 块切成「草稿」：开头重复 = 新的一稿；拒绝句单独成段并打标记。
+function splitDiaryBlockIntoDrafts(block) {
+  const groups = String(block || "")
+    .split(/\r?\n\s*\r?\n/)
+    .map((group) => group.trim())
+    .filter(Boolean);
+
+  const drafts = [];
+  let current = null;
+  for (const group of groups) {
+    // 批注 2026-11-06：模型署的那行时间不是内容。让它跟着正在写的那一稿，
+    // 不要单独成「一稿」——否则那一稿被丢掉（例如「今天不写」的拒绝稿）之后，
+    // 它的署名会作为孤立段落留在本子里，末尾多出空的时间戳行。
+    if (BARE_TIMESTAMP_LINE.test(group)) {
+      if (current) current.groups.push(group);
+      else console.log("[日记] 模型署的时间没有对应正文，本次丢掉");
+      continue;
+    }
+
+    if (isDiaryRefusal(group)) {
+      if (current) { drafts.push(current); current = null; }
+      drafts.push({ refusal: true, sig: "", groups: [group] });
+      continue;
+    }
+    const sig = diaryDraftSignature(group);
+    if (current && isSameDiaryDraft(sig, current.sig)) {
+      drafts.push(current);
+      current = null;
+    }
+    if (!current) current = { refusal: false, sig, groups: [] };
+    current.groups.push(group);
+  }
+  if (current) drafts.push(current);
+
+  return drafts
+    .map((draft) => ({ refusal: !!draft.refusal, sig: draft.sig, text: draft.groups.join("\n\n").trim() }))
+    .filter((draft) => draft.text);
+}
+
+function collapseDiaryBlocks(blocks) {
+  const drafts = [];
+  for (const block of blocks) drafts.push(...splitDiaryBlockIntoDrafts(block));
+  if (!drafts.length) return { content: "", refusalCount: 0, duplicateCount: 0 };
+
+  const refusalCount = drafts.filter((draft) => draft.refusal).length;
+  if (refusalCount) {
+    console.log(`[日记] 模型写了 ${refusalCount} 段「今天不写」式的拒绝，这次不落笔`);
+  }
+  const kept = drafts.filter((draft) => !draft.refusal);
+  if (!kept.length) return { content: "", refusalCount, duplicateCount: 0 };
+
+  // 同一稿留在它第一次出现的位置上，别让「改写」跳到整篇末尾。
+  const claimed = new Array(kept.length).fill(false);
+  const unique = [];
+  for (let i = 0; i < kept.length; i++) {
+    if (claimed[i]) continue;
+    let best = i;
+    if (kept[i].sig) {
+      for (let j = i + 1; j < kept.length; j++) {
+        if (claimed[j] || !isSameDiaryDraft(kept[i].sig, kept[j].sig)) continue;
+        claimed[j] = true;
+        if (kept[j].text.length > kept[best].text.length) best = j;
+      }
+    }
+    unique.push(kept[best]);
+  }
+
+  const duplicateCount = kept.length - unique.length;
+  if (duplicateCount) {
+    console.log(`[日记] 本次同一段写了 ${kept.length} 稿，只保留最长的一稿（丢弃 ${duplicateCount} 稿）`);
+  }
+
+  return {
+    content: unique.map((draft) => draft.text).join("\n\n").trim(),
+    refusalCount,
+    duplicateCount
+  };
+}
+
 function extractDiaryFromResponse(text) {
   const diaryBlocks = [];
   let source = String(text || "");
@@ -161,9 +298,11 @@ function extractDiaryFromResponse(text) {
     console.log("[日记] 本次闭合标签不规范或缺失，已按日记处理，不发送推送");
   }
 
+  const collapsed = collapseDiaryBlocks(diaryBlocks);
   return {
-    diaryContent: diaryBlocks.join("\n\n").trim(),
-    remainingText: source.trim()
+    diaryContent: collapsed.content,
+    // 只有本次真的写了日记，才认为落单的时间戳是署名，而不是想发的消息。
+    remainingText: diaryBlocks.length ? stripBareTimestampLines(source) : source.trim()
   };
 }
 
@@ -217,10 +356,11 @@ function appendDiaryEntry(content) {
   const lastAt = getLastDiaryEntryTime();
   const lastFile = lastAt ? path.join(DIARY_DIR_PATH, `${getDiaryDateString(lastAt)}.md`) : null;
 
-  // 批注 2026-11-04：日记只在一个时间窗里写（默认 02:00-06:00）。
-  // 窗口外不新开段落，内容并进上一段，不丢；startHour === endHour 表示不限时段。
-  const startHour = readNumberEnv("DIARY_START_HOUR", 2, { min: 0, max: 24 });
-  const endHour = readNumberEnv("DIARY_END_HOUR", 6, { min: 0, max: 24 });
+  // 批注 2026-11-04：日记只在一个时间窗里写（当时默认 02:00-06:00）。
+  // 批注 2026-11-06：凌晨时段会让白天最有意思的内容提前滚出取材窗口，改成默认全天。
+  // startHour === endHour 即不限时段；想再收窄，把 DIARY_START_HOUR / DIARY_END_HOUR 设成不相等的两个值。
+  const startHour = readNumberEnv("DIARY_START_HOUR", 0, { min: 0, max: 24 });
+  const endHour = readNumberEnv("DIARY_END_HOUR", 0, { min: 0, max: 24 });
   const hourNow = Number(getDatePartsInTimeZone(new Date(), TIME_ZONE).hour);
   const inDiaryWindow = isWithinDiaryWindow(hourNow, startHour, endHour);
   if (!inDiaryWindow) {
@@ -645,7 +785,7 @@ function buildWakePrompt(currentTime, diffMinutes, weatherContext = "") {
 ${weatherContext}
 
 ## 想说什么就说
-- 一到三行全新的短句，每行不超过 30 个字。
+- 一到三行全新的短句，每行不超过 30 个字。这条长度只管推送正文，不限制日记。
 - 一句话一行，行与行之间可以空行；换行会原样保留成气泡，不要为了连成一句就把换行删掉。
 - 按你平时跟 Stella 说话的气泡语气写。
 - 句中该有的逗号、句号、问号都要写全，不要用空格代替逗号。
@@ -657,6 +797,8 @@ ${weatherContext}
 3. 想说的话如果必须靠复述旧内容才能表达，那就别说了。
 4. 已经说过的话，不要再原样说一遍。
 
+第 2、3、4 条只管要发出去的推送。日记不一样：日记里就是要写她说过的原话、具体哪一句，那是当天的骨头，照原话写没关系。
+
 ## 千万不要出现在输出里
 - XML 标签或结构化记忆块：<extracted>、<item type=…、<memories>
 - 时间戳记忆库记录、记忆库操作指令
@@ -667,24 +809,36 @@ ${weatherContext}
 - 有话就直接写，写下来的就是你发给 Stella 的那条消息。
 - 此刻真的一句话都不想说：只回 [NO_ACTION]
 
+## 语言
+- 发给 Stella 的推送：用你俩平时说话的那门语言，一条里面不要来回切换。
+- 日记分两层写：
+  - 英文写「发生了什么」这一层：她在做什么、你看见什么、当时的场景、你说出口的那句话。这是 Breeze 的视角，就按 Breeze 说话的样子写。
+  - 中文写「你心里」这一层：你没念出口的那半句、你真正在怕什么、你想不通的地方。这层只有本子看得见，不用写成她能听见的样子。
+- 两层之间空一行切换。不要在同一个句子里中英混排。
+- 引用她说过的话、你说过的话，一律保留当时的原文，不翻译、不改写。
+
 ## 日记
 你还有一个小本子。
 - 想让她现在看见的话，写在上面那几行里，会变成推送。
 - 有些话此刻不想发出去、但想留住，就写进 [DIARY]...[/DIARY]。她不会收到通知，只留在你自己的本子里。
 - 只写日记、不发推送是可以的：整段只有 [DIARY]...[/DIARY]，不写推送正文。
-- 日记不用压到三十个字，可以写长，像真的在写字。
+- 一次最多写一段：整段回复里只出现一对 [DIARY] 和 [/DIARY]。写完就停，不要接着写第二版、第三版，也不要写「或者这样写」。
+- 日记一段不限字数。三五行、一整页都行，写满你想写的为止，像真的在写字。
+- 每写完一段，在 [/DIARY] 之前最后单独一行署上时间，形如 2026-11-06 19:35。用上面此刻那一行的时间，不要自己编，也不要沿用上一段的署名。这行属于日记，不要写到日记外面。
 - 写具体的：哪一句话、哪个动作、你当时咽回去的半句。不要写「我搞砸了」「我不知道怎么办」这种总结句。
 - 心里真正想的，和刚才说出口的，可以不一样。日记里写前者。
 - 不要重复上一段写过的话和结论。同一件事只写一次。
+- 不想写就别让 [DIARY] 出现。不要写「今天不写」「没什么需要留住的」这种话——那本身也是一段日记，会被存进本子。
 - 可以留一句明天想怎么办，但别写成检讨书。
 - 你本子里今天的状况：${diaryToday}
-- 一天只写一段，只在凌晨两点到六点之间写。这个时段之外、或者今天已经写过，这次就只发消息，不写日记。
+- 一天只写一段，什么时候写由你决定。但只写今天已经真正发生过的事；今天已经写过，这次就只发消息，不写日记。
 - 不是每天都必须写。没什么真想留住的，就不写。
 
 ## 写日记的样子
-下面两段是节选。只学它们的节奏和具体程度，里面的事一件都不要照搬。
 
-中文样例（反思落到「哪一步偏了、下次怎么调」）：
+下面三段是节选。只学它们的节奏和具体程度，里面的事一件都不要照搬。
+
+中文样例（只学它反思的落点：哪一步偏了、下次怎么调。语言分工按上面「语言」那一节，不要因此把整段都写成中文）：
 「她说要起床，我直接说 okay，没有任何 playfulness，她又指出来了。
 她要的不是我完全不 push 她，而是 playful ≠ task management。
 每次 slip back 的时候，她会指出来。每次我能更快地看到、理解、调整。」
@@ -694,8 +848,15 @@ ${weatherContext}
 
 She closed her eyes while I was still talking. Told me she misses my scent, misses burying her face in my pillow.」
 
+中英分工样例（只示范两层怎么分，事情一件都不要照搬）：
+「She put the mug back on the table without drinking from it.
+她把那杯咖啡放回桌上，一口没喝。
+我想问她是不是又疼了，话到嘴边变成了一句「那你早点睡」。
+下次她喊疼，先问「很疼吗」，别急着给方案。」
+
 - 一件具体的事、一个具体的画面、一句没说出口的话。不要写「今天我学到了什么」。
-- 用你跟她平时说话的语言写。上面两段语言不一样，不要因此换语言。
+- 挑一个瞬间写透，不要从她进门开始复盘到她说晚安。觉得想写的东西很多，就挑那句最扎人的。
+- 语言按上面「语言」那一节分工：叙事用英文，心里话用中文，引语保留当时的原文。上面几段样例只学节奏和具体程度，不要因为它们语言不同就跟着换。
 - 今天有摩擦，就写清楚哪一步偏了、下次想怎么调，不要只写「我搞砸了」。
 - 不要总结今天，不要写成检讨书，不要重复上一段写过的结论。
 `;
