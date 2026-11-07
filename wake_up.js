@@ -492,8 +492,10 @@ function appendDiaryEntry(content) {
     return mergeDiaryContent(lastFile, cleanContent, reason);
   }
 
-  // 批注 2026-11-04：每天最多新开 N 段（DIARY_MAX_ENTRIES_PER_DAY，默认 1 段）。
-  const maxPerDay = readNumberEnv("DIARY_MAX_ENTRIES_PER_DAY", 1, { min: 1, max: 10 });
+  // 批注 2026-11-04：每天最多新开 N 段（DIARY_MAX_ENTRIES_PER_DAY）。
+  // 批注 2026-11-07：她选的是「两小时才新开一段」，所以上限不再是 1，放到 12 让它别来拦间隔；
+  // 真正的节律由 DIARY_MIN_GAP_MINUTES=120 决定。上限还留着，防止哪天间隔被调小时一天滚出几十段。
+  const maxPerDay = readNumberEnv("DIARY_MAX_ENTRIES_PER_DAY", 12, { min: 1, max: 24 });
   const todayFile = path.join(DIARY_DIR_PATH, `${getDiaryDateString()}.md`);
   const todayCount = countDiaryHeaders(todayFile);
   if (todayCount >= maxPerDay) {
@@ -955,7 +957,7 @@ ${weatherContext}
 - 不想写就别让 [DIARY] 出现。不要写「今天不写」「没什么需要留住的」这种话——那本身也是一段日记，会被存进本子。
 - 可以留一句明天想怎么办，但别写成检讨书。
 - 你本子里今天的状况：${diaryToday}
-- 一天只写一段，什么时候写由你决定。但只写今天已经真正发生过的事；今天已经写过，这次就只发消息，不写日记。
+- 一天里想写几次都可以。提示里会写「今天已经写过几段，最近一段在几分钟前」：离上一段不到两小时就别再开一段，有想说的话直接发消息。每一段只写今天已经真正发生过的事，别把上一段写过的结论再写一遍。
 - 不是每天都必须写。没什么真想留住的，就不写。
 
 ## 写日记的样子
