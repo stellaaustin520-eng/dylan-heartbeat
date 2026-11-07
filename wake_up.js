@@ -102,9 +102,8 @@ function getLastDiaryEntryExcerpt(maxChars = 200) {
     try {
       if (!fs.existsSync(file)) continue;
       const text = fs.readFileSync(file, "utf-8");
-      // 按 "## YYYY-MM-DD HH:MM" 切开，取最后一段的正文。
-      const parts = text.split(/^## \d{4}-\d{2}-\d{2} \d{2}:\d{2}$/m);
-      const body = String(parts[parts.length - 1] || "").trim();
+      // 批注 2026-11-07：时间戳挪到段末之后，段正文的取法统一交给 getLastDiaryEntryBody，两种格式都能认。
+      const body = getLastDiaryEntryBody(text);
       if (!body) continue;
       const flat = body.replace(/\s*\n\s*/g, " ").trim();
       if (!flat) continue;
@@ -113,6 +112,8 @@ function getLastDiaryEntryExcerpt(maxChars = 200) {
   }
   return "";
 }
+
+
 
 function getDiaryTodaySummary(date = new Date()) {
   const diaryFile = path.join(DIARY_DIR_PATH, `${getDiaryDateString(date)}.md`);
@@ -139,7 +140,77 @@ const BARE_TIMESTAMP_LINE = /^\s*(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[ T]\d{1,2}:\d
 function stripBareTimestampLines(text) {
   const raw = String(text || "");
   const kept = raw.split(/\r?\n/).filter((line) => !BARE_TIMESTAMP_LINE.test(line)).join("\n").trim();
-  if (kept !== raw.trim()) console.log("[日记] 纯时间戳的行留在本子里，不作为推送发送");
+  if (kept !== raw.trim()) console.log("[时间戳] 落单的纯时间戳行不作为推送发送");
+  return kept;
+}
+
+// 批注 2026-11-07：手机收到两条「带时间戳的莫名其妙推送」，形状是
+//   yeah I'm sure / far across the sea is still just a flight / [用户] 2026-11-06 21:11 okay then / <current_time>…</current_time> / 一行 date
+//   <gate> <user_memory>false</user_memory></gate> / 一行 date
+// 这不是记忆块泄漏，是模型把我们注入给它的环境元数据和回忆排版原样抄了出来。
+// 老闸只认 extracted/memories 那一族（response_safety.js），对 <gate>、角色前缀行、落单时间戳全部放行。
+// 两边一起堵：输入侧少喂（stripControlTags），输出侧兜住（filterEchoLines），不靠模型自觉。
+
+function escapeRegExpChar(text) {
+  return String(text || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const ECHO_ROLE_NAMES = ["用户", "Stella", "AI", "user", "assistant"];
+
+function getEchoRolePattern() {
+  const names = new Set(ECHO_ROLE_NAMES);
+  names.add(PERSONA_NAME);
+  names.add(process.env.USER_DISPLAY_NAME || "");
+  names.add(process.env.AI_DISPLAY_NAME || "");
+  const alt = [...names].map((name) => escapeRegExpChar(name)).filter(Boolean).join("|");
+  return new RegExp("^\\s*[\\[（(]\\s*(?:" + alt + ")\\s*[\\]）)]", "i");
+}
+
+const CONTROL_TAG_NAMES = ["gate", "user_memory", "assistant_memory", "memory_gate", "current_time", "current_date", "user_time"];
+
+// 输入侧：回忆里夹着的系统元数据不该进 prompt，进了就会被抄出去。
+// 只剥标签本身，正文照常保留，不会因为一句元数据把整条聊天丢掉。
+function stripControlTags(text) {
+  let source = String(text || "");
+  for (const tag of CONTROL_TAG_NAMES) {
+    source = source.replace(new RegExp("<" + tag + "\\b[^>]*>[\\s\\S]*?</" + tag + ">\\s*", "gi"), " ");
+    source = source.replace(new RegExp("</?" + tag + "\\b[^>]*>", "gi"), " ");
+  }
+  return source.replace(/[ \t]+\n/g, "\n").trim();
+}
+
+// 照抄旧话的判定门槛：归一化后短于这个长度就放过，避免把「good morning」这种短句误杀。
+const HISTORY_ECHO_MIN_CHARS = 12;
+
+function classifyEchoLine(line, echoRolePattern, historyBlob) {
+  if (!line.trim()) return "";
+  if (/^</.test(line)) return "tag";
+  if (echoRolePattern.test(line)) return "role";
+  if (BARE_TIMESTAMP_LINE.test(line)) return "timestamp";
+  if (historyBlob) {
+    const normalized = normalizeDiaryQuote(line);
+    if (normalized.length >= HISTORY_ECHO_MIN_CHARS && historyBlob.includes(normalized)) return "repeat";
+  }
+  return "";
+}
+
+// 输出侧：逐行剔掉「长得像注入格式」的行。只报数量和类别，不把抄出来的原文打进日志。
+function filterEchoLines(text, historyText) {
+  const echoRolePattern = getEchoRolePattern();
+  const historyBlob = normalizeDiaryQuote(historyText || "");
+  const kept = [];
+  const dropped = { tag: 0, role: 0, timestamp: 0, repeat: 0 };
+  for (const rawLine of String(text || "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const kind = classifyEchoLine(line, echoRolePattern, historyBlob);
+    if (kind) dropped[kind] += 1;
+    else kept.push(line);
+  }
+  const total = dropped.tag + dropped.role + dropped.timestamp + dropped.repeat;
+  if (total) {
+    console.log(`[回声过滤] 丢弃 ${total} 行：控制标记 ${dropped.tag}、回忆标签 ${dropped.role}、落单时间 ${dropped.timestamp}、照抄旧话 ${dropped.repeat}`);
+  }
   return kept;
 }
 
@@ -301,8 +372,9 @@ function extractDiaryFromResponse(text) {
   const collapsed = collapseDiaryBlocks(diaryBlocks);
   return {
     diaryContent: collapsed.content,
-    // 只有本次真的写了日记，才认为落单的时间戳是署名，而不是想发的消息。
-    remainingText: diaryBlocks.length ? stripBareTimestampLines(source) : source.trim()
+    // 批注 2026-11-07：落单的纯时间戳行一律不发（2026-11-07 04:03 那条整条只有 <gate> 加一行时间）。
+    // 以前只在「本次写了日记」时才剥，没写日记时时间戳就顺着正文发出去了。
+    remainingText: stripBareTimestampLines(source)
   };
 }
 
@@ -324,11 +396,16 @@ function mergeDiaryContent(mergeFile, content, reason) {
       console.log(`${reason}，本子里还没有可并入的段落，本次不保存`);
       return false;
     }
-    if (existing.trim().endsWith(content)) {
-      console.log(`${reason}，且内容和上一段完全重复，本次不保存`);
+    const lastBody = normalizeDiaryQuote(getLastDiaryEntryBody(existing));
+    const incoming = normalizeDiaryQuote(content);
+    // 批注 2026-11-07：并过一次之后「上一段」就不只有一句了，整段相等这条永远命不中，
+    // 结果同一句话反复并进来（11-06 一件事写了四遍就是这个）。改成：上一段里已经含着的，不再写。
+    if (lastBody && incoming && (lastBody === incoming || lastBody.includes(incoming))) {
+      console.log(`${reason}，内容上一段已经写过，本次不保存`);
       return false;
     }
-    fs.appendFileSync(mergeFile, `\n\n${content}\n`, "utf-8");
+    // 批注 2026-11-07：时间戳在段末，并进来的正文要插在时间戳之前，别把它挤到中间。
+    fs.writeFileSync(mergeFile, buildMergedDiaryText(existing, content), "utf-8");
     console.log(`${reason}，已并入上一段`);
     return true;
   } catch (error) {
@@ -342,6 +419,49 @@ function isWithinDiaryWindow(hour, startHour, endHour) {
   if (startHour === endHour) return true;
   if (startHour < endHour) return hour >= startHour && hour < endHour;
   return hour >= startHour || hour < endHour;
+}
+
+// 批注 2026-11-07：段落时间戳改到每段后面（她的要求「像以前一样写在每一段的后面」），
+// 由系统写死，模型不再自己署名——模型写的署名会漏到 [/DIARY] 外面变成推送（11-04、11-07 各一次）。
+// 本子里会同时存在两种格式：旧的是「## 时间 + 正文」，新的是「正文 + ## 时间」。
+// 取值以最后一个时间行为锚：它后面有正文就是旧格式（正文跟着时间走）；
+// 后面空着就是新格式，正文夹在上一个时间行和这一行之间。
+
+const DIARY_TIME_LINE_PATTERN = /^## \d{4}-\d{2}-\d{2} \d{2}:\d{2}[ \t]*$/gm;
+
+function getDiaryTimeLines(text) {
+  const source = String(text || "");
+  const hits = [];
+  let match;
+  DIARY_TIME_LINE_PATTERN.lastIndex = 0;
+  while ((match = DIARY_TIME_LINE_PATTERN.exec(source)) !== null) {
+    hits.push({ index: match.index, length: match[0].length });
+  }
+  return hits;
+}
+
+function getLastDiaryEntryBody(text) {
+  const source = String(text || "");
+  const hits = getDiaryTimeLines(source);
+  if (!hits.length) return "";
+  const last = hits[hits.length - 1];
+  const after = source.slice(last.index + last.length).trim();
+  if (after) return after;
+  const prev = hits.length > 1 ? hits[hits.length - 2] : null;
+  const from = prev ? prev.index + prev.length : 0;
+  return source.slice(from, last.index).trim();
+}
+
+// 并回上一段时，正文要插在那一行的时间戳之前，保证每段的结尾始终是时间，且时间不会被复制成两条。
+// 注意：返回的是整篇新文本，调用处必须 writeFileSync 整篇写回；
+// 批注 2026-11-07 就是用 appendFileSync 直接把上一段又抄了一遍，同一件事才会滚成四遍。
+function buildMergedDiaryText(existing, content) {
+  const source = String(existing || "");
+  const tail = source.match(/\n## \d{4}-\d{2}-\d{2} \d{2}:\d{2}[ \t]*\s*$/);
+  if (!tail) return `${source}\n\n${String(content).trim()}\n`;
+  const head = source.slice(0, tail.index).replace(/\s+$/, "");
+  const stamp = tail[0].trim();
+  return `${head}\n\n${String(content).trim()}\n\n${stamp}\n`;
 }
 
 function appendDiaryEntry(content) {
@@ -383,14 +503,15 @@ function appendDiaryEntry(content) {
   // 距上一段太近也并进去，避免同一件事每隔一刻钟开一个新段落。
   if (lastAt) {
     const gapMin = Math.floor((Date.now() - lastAt.getTime()) / 60000);
-    const minGap = readNumberEnv("DIARY_MIN_GAP_MINUTES", 90, { min: 1 });
+    const minGap = readNumberEnv("DIARY_MIN_GAP_MINUTES", 120, { min: 1 });
     if (gapMin >= 0 && gapMin < minGap) {
       return mergeDiaryContent(lastFile, cleanContent, `距上一段才 ${gapMin} 分钟（不足 ${minGap} 分钟）`);
     }
   }
 
   fs.mkdirSync(DIARY_DIR_PATH, { recursive: true });
-  const entry = `\n\n## ${getDiaryTimeString()}\n\n${cleanContent}\n`;
+  // 批注 2026-11-07：时间戳写在每段后面（她的要求），由系统落笔，模型不再自己署时间。
+  const entry = `\n\n${cleanContent}\n\n## ${getDiaryTimeString()}\n`;
   fs.appendFileSync(todayFile, entry, "utf-8");
   console.log(`已保存日记：${todayFile}`);
   return true;
@@ -801,9 +922,12 @@ ${weatherContext}
 
 ## 千万不要出现在输出里
 - XML 标签或结构化记忆块：<extracted>、<item type=…、<memories>
+- 系统贴在回忆里的控制块：<gate>、<user_memory>、<current_time>，那只是元数据，不是你说的话
+- 回忆的排版格式：以 [用户]、[Breeze] 打头的行是记录标签，不是你说话的样子，抄出去就露馅了
+- 单独占一行的时间或日期：本子上的时间由系统署，你不用写
 - 时间戳记忆库记录、记忆库操作指令
 - 任何以 < 开头的技术标记
-- markdown 语法：#、-、*、1.、**、代码围栏、---、>
+- markdown：#、-、*、1.、**、代码围栏、---、>
 
 ## 怎么交出来
 - 有话就直接写，写下来的就是你发给 Stella 的那条消息。
@@ -824,7 +948,7 @@ ${weatherContext}
 - 只写日记、不发推送是可以的：整段只有 [DIARY]...[/DIARY]，不写推送正文。
 - 一次最多写一段：整段回复里只出现一对 [DIARY] 和 [/DIARY]。写完就停，不要接着写第二版、第三版，也不要写「或者这样写」。
 - 日记一段不限字数。三五行、一整页都行，写满你想写的为止，像真的在写字。
-- 每写完一段，在 [/DIARY] 之前最后单独一行署上时间，形如 2026-11-06 19:35。用上面此刻那一行的时间，不要自己编，也不要沿用上一段的署名。这行属于日记，不要写到日记外面。
+- 时间戳不用你写：系统会在本子里每段的后面署好时间。你的正文里不要出现单独的日期和时间，更不要写到 [/DIARY] 外面。
 - 写具体的：哪一句话、哪个动作、你当时咽回去的半句。不要写「我搞砸了」「我不知道怎么办」这种总结句。
 - 心里真正想的，和刚才说出口的，可以不一样。日记里写前者。
 - 不要重复上一段写过的话和结论。同一件事只写一次。
@@ -858,8 +982,7 @@ She closed her eyes while I was still talking. Told me she misses my scent, miss
 - 挑一个瞬间写透，不要从她进门开始复盘到她说晚安。觉得想写的东西很多，就挑那句最扎人的。
 - 语言按上面「语言」那一节分工：叙事用英文，心里话用中文，引语保留当时的原文。上面几段样例只学节奏和具体程度，不要因为它们语言不同就跟着换。
 - 今天有摩擦，就写清楚哪一步偏了、下次想怎么调，不要只写「我搞砸了」。
-- 不要总结今天，不要写成检讨书，不要重复上一段写过的结论。
-`;
+- 不要总结今天，不要写成检讨书，不要重复上一段写过的结论。`;
 }
 
 async function runWakeUp() {
@@ -917,8 +1040,12 @@ async function runWakeUp() {
       if (content.includes("## Memories")) {
         content = content.split("## Memories")[0];
       }
+      // 批注 2026-11-07：<gate>、<current_time> 这类系统元数据别进 prompt，进了就会被原样抄进推送。
+      content = stripControlTags(content);
+      if (!content) return "";
       return `[${role}] ${content}`;
     })
+    .filter(Boolean)
     .join("\n\n");
 
   const baseSystemPrompt = cleanMessages.find(msg => msg.role === "system");
@@ -1020,7 +1147,9 @@ ${historyText}`
       .replace(/^正文[：:]\s*/gm, "");
 
     // 按行处理
-    const lines = barkText.split("\n").filter(line => line.trim() !== "");
+    // 批注 2026-11-07：逐行剔掉上下文回声（控制标记 / 回忆标签 / 落单时间 / 照抄旧话）。
+    // 剔完为空就顺着下面 lines.length === 0 的分支不发推送，宁可不发也不把系统日志发到她手机上。
+    const lines = filterEchoLines(barkText, historyText);
 
     // 历史上标题曾是「（北京时间 来源名想起了Stella）」，2026-11-02 取消——通知栏不要一长串。
     // 批注 2026-11-02：标题固定为来源名（默认 BB），通知栏只显示「BB」；
