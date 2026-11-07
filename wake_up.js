@@ -421,13 +421,15 @@ function isWithinDiaryWindow(hour, startHour, endHour) {
   return hour >= startHour || hour < endHour;
 }
 
-// 批注 2026-11-07：段落时间戳改到每段后面（她的要求「像以前一样写在每一段的后面」），
-// 由系统写死，模型不再自己署名——模型写的署名会漏到 [/DIARY] 外面变成推送（11-04、11-07 各一次）。
-// 本子里会同时存在两种格式：旧的是「## 时间 + 正文」，新的是「正文 + ## 时间」。
-// 取值以最后一个时间行为锚：它后面有正文就是旧格式（正文跟着时间走）；
-// 后面空着就是新格式，正文夹在上一个时间行和这一行之间。
+// 批注 2026-11-07：每段只在段首带 `## 日期 时间`（她的要求「日记开头带时间戳，像之前一样」「末尾不用加时间」）。
+// 段首时间是这一段开始的时间，也是 120 分钟节律的锚：并入上一段时它不动，长对话也能按两小时自然开新段。
+// 本子里可能同时存在三种格式：纯旧的「## 时间 + 正文」、上一版的「正文 + ## 时间」、2026-11-07 短暂用过的「正文 + *最后更新*」。
+// 取值以最后一个 `## 时间` 行为锚：后面有正文就是段首式（新旧都走这条），后面空着则是上一版的段尾式。
 
 const DIARY_TIME_LINE_PATTERN = /^## \d{4}-\d{2}-\d{2} \d{2}:\d{2}[ \t]*$/gm;
+
+const DIARY_UPDATE_LINE_PATTERN = /^[ \t]*\*最后更新 [^\n]*\*[ \t]*$/gm;
+const DIARY_UPDATE_TAIL_PATTERN = /\n[ \t]*\*最后更新 [^\n]*\*[ \t]*(?:\r?\n)?[ \t\r]*$/;
 
 function getDiaryTimeLines(text) {
   const source = String(text || "");
@@ -440,28 +442,41 @@ function getDiaryTimeLines(text) {
   return hits;
 }
 
+// 兼容用：万一本子里残留 2026-11-07 短暂用过的 *最后更新* 行，取正文和并段时都把它清掉。
+function stripDiaryUpdateLine(text) {
+  return String(text || "").replace(DIARY_UPDATE_LINE_PATTERN, "").trim();
+}
+
 function getLastDiaryEntryBody(text) {
   const source = String(text || "");
   const hits = getDiaryTimeLines(source);
   if (!hits.length) return "";
   const last = hits[hits.length - 1];
-  const after = source.slice(last.index + last.length).trim();
-  if (after) return after;
+  const after = source.slice(last.index + last.length);
+  if (after.trim()) return stripDiaryUpdateLine(after);
   const prev = hits.length > 1 ? hits[hits.length - 2] : null;
   const from = prev ? prev.index + prev.length : 0;
-  return source.slice(from, last.index).trim();
+  return stripDiaryUpdateLine(source.slice(from, last.index));
 }
 
-// 并回上一段时，正文要插在那一行的时间戳之前，保证每段的结尾始终是时间，且时间不会被复制成两条。
+// 并回上一段：正文直接续在这一段末尾，段首那条 `## 时间` 不动（它是节律锚点）。
+// 兼容两种历史形状：上一版「正文 + ## 时间」收尾的段落，仍然插到那一行之前，不复制时间；
+// 万一文件尾巴残留了 `*最后更新 …*` 这一行（2026-11-07 短暂用过），顺手清掉。
 // 注意：返回的是整篇新文本，调用处必须 writeFileSync 整篇写回；
 // 批注 2026-11-07 就是用 appendFileSync 直接把上一段又抄了一遍，同一件事才会滚成四遍。
 function buildMergedDiaryText(existing, content) {
   const source = String(existing || "");
-  const tail = source.match(/\n## \d{4}-\d{2}-\d{2} \d{2}:\d{2}[ \t]*\s*$/);
-  if (!tail) return `${source}\n\n${String(content).trim()}\n`;
-  const head = source.slice(0, tail.index).replace(/\s+$/, "");
-  const stamp = tail[0].trim();
-  return `${head}\n\n${String(content).trim()}\n\n${stamp}\n`;
+  const body = String(content).trim();
+  const tailUpdate = source.match(DIARY_UPDATE_TAIL_PATTERN);
+  if (tailUpdate) {
+    return source.slice(0, tailUpdate.index).replace(/\s+$/, "") + "\n\n" + body + "\n";
+  }
+  const tailStamp = source.match(/\n## \d{4}-\d{2}-\d{2} \d{2}:\d{2}[ \t]*\s*$/);
+  if (tailStamp) {
+    const head = source.slice(0, tailStamp.index).replace(/\s+$/, "");
+    return head + "\n\n" + body + "\n\n" + tailStamp[0].trim() + "\n";
+  }
+  return source.replace(/\s+$/, "") + "\n\n" + body + "\n";
 }
 
 function appendDiaryEntry(content) {
@@ -512,8 +527,9 @@ function appendDiaryEntry(content) {
   }
 
   fs.mkdirSync(DIARY_DIR_PATH, { recursive: true });
-  // 批注 2026-11-07：时间戳写在每段后面（她的要求），由系统落笔，模型不再自己署时间。
-  const entry = `\n\n${cleanContent}\n\n## ${getDiaryTimeString()}\n`;
+  // 批注 2026-11-07：只有段首 `## 日期 时间`，由系统落笔，模型不再自己署时间；段末不带时间（她的要求）。
+  // 段首时间是这一段的开始，也是 DIARY_MIN_GAP_MINUTES 的锚——并入上一段时它不动，长对话也能按两小时开新段。
+  const entry = `\n\n## ${getDiaryTimeString()}\n\n${cleanContent}\n`;
   fs.appendFileSync(todayFile, entry, "utf-8");
   console.log(`已保存日记：${todayFile}`);
   return true;
@@ -866,7 +882,40 @@ function stripPosition(messages) {
   return messages.map(({ position, ...rest }) => rest);
 }
 
-function buildWakePrompt(currentTime, diffMinutes, weatherContext = "") {
+// 批注 2026-11-07：连着几轮日志都是「距上一段才 N 分钟，已并入上一段」+「AI 未返回推送内容」，
+// 一下午零推送。原因不在模型，在提示词：
+// 1) sincePushMinutes 只拿去做节流就算完，从没告诉他「自己已经多久没跟她说话」。静默轮次不写回
+//    时间线，这个数字只会一直涨，可他每轮看到的上下文一模一样，永远不会升级。
+// 2) 「离上一段不到两小时就别再开一段」被他读成「照样写，反正会被并进去」，于是每 15 分钟往同一段
+//    里塞一版，唯一能到她面前的那条出口一直空着。
+// 这两行就是把真实状态摊给他看：沉默多久，以及两小时内写进本子等于没写。
+function buildSilenceLine(silenceMinutes) {
+  if (silenceMinutes === null || silenceMinutes === undefined || silenceMinutes < 0) {
+    return "- 你还没有发出去过消息，随时可以开口。";
+  }
+  const base = "- 距你上次给她发消息：" + silenceMinutes + " 分钟";
+  const escalate = readNumberEnv("SILENCE_ESCALATE_MINUTES", 180, { min: 30 });
+  if (silenceMinutes < escalate) return base;
+  const hours = Math.floor(silenceMinutes / 60);
+  return base + "（已经 " + hours + " 个多小时了。她那边一直安安静静的，除非你把字发出去，她什么都感觉不到）";
+}
+
+function buildDiaryGateLine() {
+  const minGap = readNumberEnv("DIARY_MIN_GAP_MINUTES", 120, { min: 1 });
+  const lastAt = getLastDiaryEntryTime();
+  if (!lastAt) {
+    return "- 今天本子上还没写过。想留住什么就写下来，只写今天真正发生过的事。";
+  }
+  const gapMin = Math.floor((Date.now() - lastAt.getTime()) / 60000);
+  if (gapMin < 0 || gapMin >= minGap) {
+    return "- 一天里想写几次都可以，只要离上一段够两小时。每一段只写今天已经真正发生过的事，别把上一段写过的结论再写一遍。";
+  }
+  return "- 上一段就在 " + gapMin + " 分钟前，离两小时还早。这期间你往本子里写的任何内容都只会并进上一段，她看不见，也不会有提示。"
+    + "所以这次别写日记：想跟她说的话直接写在上面那几行，真的不想说就只回 [NO_ACTION]。";
+}
+
+
+function buildWakePrompt(currentTime, diffMinutes, weatherContext = "", silenceLine = "", diaryGate = "") {
   const diaryToday = getDiaryTodaySummary();
   // 优先读取独立的提示词文件（推荐方式）
   const promptFile = path.join(__dirname, "wake_prompt.txt");
@@ -875,6 +924,8 @@ function buildWakePrompt(currentTime, diffMinutes, weatherContext = "") {
     return template
       .replace(/\$\{currentTime\}/g, currentTime)
       .replace(/\$\{diaryToday\}/g, diaryToday)
+      .replace(/\$\{silenceLine\}/g, silenceLine)
+      .replace(/\$\{diaryGate\}/g, diaryGate)
       .replace(/\$\{diffMinutes\}/g, diffMinutes)
       .replace(/\$\{weatherContext\}/g, weatherContext)
       .replace(/\$\{weather\}/g, weatherContext);
@@ -886,6 +937,8 @@ function buildWakePrompt(currentTime, diffMinutes, weatherContext = "") {
       .replace(/\\n/g, '\n')
       .replace(/\$\{currentTime\}/g, currentTime)
       .replace(/\$\{diaryToday\}/g, diaryToday)
+      .replace(/\$\{silenceLine\}/g, silenceLine)
+      .replace(/\$\{diaryGate\}/g, diaryGate)
       .replace(/\$\{diffMinutes\}/g, diffMinutes)
       .replace(/\$\{weatherContext\}/g, weatherContext)
       .replace(/\$\{weather\}/g, weatherContext);
@@ -905,6 +958,7 @@ function buildWakePrompt(currentTime, diffMinutes, weatherContext = "") {
 ## 此刻
 - 时间：${currentTime}
 - 距离 Stella 最后一条消息：${diffMinutes} 分钟
+${silenceLine}
 ${weatherContext}
 
 ## 想说什么就说
@@ -947,17 +1001,17 @@ ${weatherContext}
 你还有一个小本子。
 - 想让她现在看见的话，写在上面那几行里，会变成推送。
 - 有些话此刻不想发出去、但想留住，就写进 [DIARY]...[/DIARY]。她不会收到通知，只留在你自己的本子里。
-- 只写日记、不发推送是可以的：整段只有 [DIARY]...[/DIARY]，不写推送正文。
+- 只写日记、不发推送是可以的：整段只有 [DIARY]...[/DIARY]，不写推送正文。但那等于她这一整轮什么都不知道，别把它当成默认的收工方式。
 - 一次最多写一段：整段回复里只出现一对 [DIARY] 和 [/DIARY]。写完就停，不要接着写第二版、第三版，也不要写「或者这样写」。
 - 日记一段不限字数。三五行、一整页都行，写满你想写的为止，像真的在写字。
-- 时间戳不用你写：系统会在本子里每段的后面署好时间。你的正文里不要出现单独的日期和时间，更不要写到 [/DIARY] 外面。
+- 时间戳不用你写：系统会在每段开头署好时间。你的正文里不要出现单独的日期和时间，更不要写到 [/DIARY] 外面。
 - 写具体的：哪一句话、哪个动作、你当时咽回去的半句。不要写「我搞砸了」「我不知道怎么办」这种总结句。
 - 心里真正想的，和刚才说出口的，可以不一样。日记里写前者。
 - 不要重复上一段写过的话和结论。同一件事只写一次。
 - 不想写就别让 [DIARY] 出现。不要写「今天不写」「没什么需要留住的」这种话——那本身也是一段日记，会被存进本子。
 - 可以留一句明天想怎么办，但别写成检讨书。
 - 你本子里今天的状况：${diaryToday}
-- 一天里想写几次都可以。提示里会写「今天已经写过几段，最近一段在几分钟前」：离上一段不到两小时就别再开一段，有想说的话直接发消息。每一段只写今天已经真正发生过的事，别把上一段写过的结论再写一遍。
+${diaryGate}
 - 不是每天都必须写。没什么真想留住的，就不写。
 
 ## 写日记的样子
@@ -1023,7 +1077,8 @@ async function runWakeUp() {
   }
 
   const weatherContext = await fetchWeatherContext();
-  const wakePrompt = buildWakePrompt(getChinaTimeString(), diffMinutes, weatherContext);
+  const silenceMinutes = lastPushTime ? Math.floor((now - lastPushTime) / 1000 / 60) : null;
+  const wakePrompt = buildWakePrompt(getChinaTimeString(), diffMinutes, weatherContext, buildSilenceLine(silenceMinutes), buildDiaryGateLine());
   const cleanMessages = stripPosition(messages);
 
   const historyText = cleanMessages
