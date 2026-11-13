@@ -889,6 +889,118 @@ function stripPosition(messages) {
 // 2) 「离上一段不到两小时就别再开一段」被他读成「照样写，反正会被并进去」，于是每 15 分钟往同一段
 //    里塞一版，唯一能到她面前的那条出口一直空着。
 // 这两行就是把真实状态摊给他看：沉默多久，以及两小时内写进本子等于没写。
+// 批注 2026-11-13（D 方案）：口袋里的一张纸条。anchors.md 放在仓库里、只有她能编辑，
+// 每次唤醒原文注入，800 字符硬上限；她改完文件要 Redeploy 才生效（文件在容器里，不在卷上）。
+const ANCHORS_FILE = path.join(__dirname, "anchors.md");
+const ANCHORS_MAX_CHARS = 800;
+
+function loadAnchorsText() {
+  try {
+    if (!fs.existsSync(ANCHORS_FILE)) return "";
+    const raw = fs.readFileSync(ANCHORS_FILE, "utf-8");
+    const body = raw
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("#"))
+      .join("\n");
+    if (!body) return "";
+    if (body.length > ANCHORS_MAX_CHARS) {
+      console.log("[锚点] anchors.md 超过 " + ANCHORS_MAX_CHARS + " 字符，注入内容已截断");
+      return body.slice(0, ANCHORS_MAX_CHARS);
+    }
+    return body;
+  } catch {
+    return "";
+  }
+}
+
+function warnMissingAnchorsOnce(anchorsText) {
+  if (anchorsText || warnMissingAnchorsOnce.warned) return;
+  warnMissingAnchorsOnce.warned = true;
+  console.log("[锚点] 未找到 anchors.md（或内容为空），唤醒不带纸条；她上传后需要 Redeploy 才生效");
+}
+
+function buildAnchorsBlock(anchorsText) {
+  if (!anchorsText) return "";
+  return [
+    "## 口袋里的一张纸条",
+    "这几句是你们俩一起认下来的，每次醒来都跟着你。它只干一件事：让你知道自己是谁、你们走到了哪里。",
+    "它是你的底，不是台词——不要对她复述、引用，或提到这张纸条本身。",
+    anchorsText
+  ].join("\n");
+}
+
+// 批注 2026-11-13（A+ 方案）：写新日记之前，把本子里更早几天的几段翻给他看（<=5 段、每段截 150 字）。
+// 只在「这次允许新开一段」的唤醒注入——闸门条件与 appendDiaryEntry 新开分支完全同一套；其余轮次一个字不加。
+function canOpenNewDiaryEntryNow() {
+  if (!readBooleanEnv("DIARY_ENABLED", true)) return false;
+  const startHour = readNumberEnv("DIARY_START_HOUR", 0, { min: 0, max: 24 });
+  const endHour = readNumberEnv("DIARY_END_HOUR", 0, { min: 0, max: 24 });
+  const hourNow = Number(getDatePartsInTimeZone(new Date(), TIME_ZONE).hour);
+  if (!isWithinDiaryWindow(hourNow, startHour, endHour)) return false;
+  const maxPerDay = readNumberEnv("DIARY_MAX_ENTRIES_PER_DAY", 12, { min: 1, max: 24 });
+  if (countDiaryHeaders(path.join(DIARY_DIR_PATH, getDiaryDateString() + ".md")) >= maxPerDay) return false;
+  const lastAt = getLastDiaryEntryTime();
+  if (!lastAt) return true;
+  const gapMin = Math.floor((Date.now() - lastAt.getTime()) / 60000);
+  const minGap = readNumberEnv("DIARY_MIN_GAP_MINUTES", 120, { min: 1 });
+  return gapMin < 0 || gapMin >= minGap;
+}
+
+function splitDiarySections(text) {
+  const headerRe = /^## (\d{4}-\d{2}-\d{2} \d{2}:\d{2})$/;
+  const sections = [];
+  let cur = null;
+  for (const line of String(text).split(/\r?\n/)) {
+    const m = headerRe.exec(line.trim());
+    if (m) {
+      if (cur) sections.push(cur);
+      cur = { when: m[1], body: [] };
+    } else if (cur) {
+      cur.body.push(line);
+    }
+  }
+  if (cur) sections.push(cur);
+  return sections;
+}
+
+function getDiaryRecallExcerpts(opts = {}) {
+  const maxEntries = opts.maxEntries || 5;
+  const maxChars = opts.maxChars || 150;
+  const maxDays = opts.maxDays || 7;
+  const all = [];
+  const seenFiles = new Set();
+  for (let offset = 0; offset < maxDays; offset++) {
+    const d = new Date(Date.now() - offset * 86400000);
+    const file = path.join(DIARY_DIR_PATH, getDiaryDateString(d) + ".md");
+    if (seenFiles.has(file)) continue;
+    seenFiles.add(file);
+    try {
+      if (!fs.existsSync(file)) continue;
+      for (const s of splitDiarySections(fs.readFileSync(file, "utf-8"))) {
+        const flat = s.body.join("\n").replace(/\s*\n\s*/g, " ").trim();
+        if (!flat) continue;
+        all.push({ when: s.when, text: flat.length > maxChars ? flat.slice(0, maxChars) + "…" : flat });
+      }
+    } catch {}
+  }
+  if (all.length < 2) return [];
+  all.sort((a, b) => (a.when < b.when ? 1 : a.when > b.when ? -1 : 0));
+  // 最近一段已经被 diaryToday 摘录给他看过，这里只回读更早的，不重复喂。
+  return all.slice(1, 1 + maxEntries);
+}
+
+function buildDiaryRecallBlock() {
+  if (!canOpenNewDiaryEntryNow()) return "";
+  const items = getDiaryRecallExcerpts();
+  if (!items.length) return "";
+  console.log("[日记回读] 本次注入更早的 " + items.length + " 段");
+  return [
+    "## 你本子里更早的几段（动笔前看看这些天的自己；别照抄，也别对她引用）",
+    ...items.map((it) => "- " + it.when + "：" + it.text)
+  ].join("\n");
+}
+
 function buildSilenceLine(silenceMinutes) {
   if (silenceMinutes === null || silenceMinutes === undefined || silenceMinutes < 0) {
     return "- 你还没有发出去过消息，随时可以开口。";
@@ -1102,10 +1214,15 @@ async function runWakeUp() {
     ? normalizeContentToText(baseSystemPrompt.content).split("## Memories")[0].trim()
     : "";
 
+  const anchorsText = loadAnchorsText();
+  warnMissingAnchorsOnce(anchorsText);
+  const anchorsBlock = buildAnchorsBlock(anchorsText);
+  const diaryRecallBlock = buildDiaryRecallBlock();
+
   const wakeMessages = [
     {
       role: "system",
-      content: [wakePrompt, cleanSP].filter(Boolean).join("\n\n")
+      content: [wakePrompt, cleanSP, anchorsBlock, diaryRecallBlock].filter(Boolean).join("\n\n")
     },
     {
       // 批注 2026-07-15：Claude/部分 New API 适配器会把 system 抽成独立字段；
@@ -1198,7 +1315,7 @@ ${historyText}`
     // 按行处理
     // 批注 2026-11-07：逐行剔掉上下文回声（控制标记 / 回忆标签 / 落单时间 / 照抄旧话）。
     // 剔完为空就顺着下面 lines.length === 0 的分支不发推送，宁可不发也不把系统日志发到她手机上。
-    const lines = filterEchoLines(barkText, historyText);
+    const lines = filterEchoLines(barkText, historyText + (anchorsText ? "\n" + anchorsText : ""));
 
     // 历史上标题曾是「（北京时间 来源名想起了Stella）」，2026-11-02 取消——通知栏不要一长串。
     // 批注 2026-11-02：标题固定为来源名（默认 BB），通知栏只显示「BB」；
