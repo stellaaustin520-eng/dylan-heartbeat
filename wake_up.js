@@ -968,6 +968,12 @@ function getDiaryRecallExcerpts(opts = {}) {
   const maxEntries = opts.maxEntries || 5;
   const maxChars = opts.maxChars || 150;
   const maxDays = opts.maxDays || 7;
+  // 过渡期闸门（2026-11-14）：底线日期之前的日记都是 Breeze 视角时代的，回读会把旧腔带回来，一律不取。
+  // 旧时代段落 7 天后（约 11-22）自然出窗，届时可把 env DIARY_RECALL_FLOOR 设成空串关闭，或随下次改动删掉。
+  const envFloor = process.env.DIARY_RECALL_FLOOR;
+  const floor = opts.floor !== undefined
+    ? String(opts.floor).trim()
+    : (envFloor === undefined ? "2026-11-15" : String(envFloor).trim());
   const all = [];
   const seenFiles = new Set();
   for (let offset = 0; offset < maxDays; offset++) {
@@ -978,6 +984,7 @@ function getDiaryRecallExcerpts(opts = {}) {
     try {
       if (!fs.existsSync(file)) continue;
       for (const s of splitDiarySections(fs.readFileSync(file, "utf-8"))) {
+        if (floor && s.when.slice(0, 10) < floor) continue;
         const flat = s.body.join("\n").replace(/\s*\n\s*/g, " ").trim();
         if (!flat) continue;
         all.push({ when: s.when, text: flat.length > maxChars ? flat.slice(0, maxChars) + "…" : flat });
